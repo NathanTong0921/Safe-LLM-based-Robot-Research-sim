@@ -10,7 +10,6 @@ import math
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__SportModeState_
-# 添加 LowState 相关导入
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowState_
 
@@ -36,7 +35,6 @@ class TaskExecutorNode(Node):
         self.current_z = 0.0
         
 
-        # Location for testing
         self.locations = {
             'entrance': (0.0, 0.0),
             'pepper_area': (3.5, 2.0),
@@ -50,11 +48,9 @@ class TaskExecutorNode(Node):
         
         ChannelFactoryInitialize(1, "lo")
 
-        # 订阅高层状态（位置和速度）
         self.high_state_suber = ChannelSubscriber("rt/sportmodestate", SportModeState_)
         self.high_state_suber.Init(self.high_state_handler, 10)
         
-        # 添加订阅低层状态（IMU 四元数）
         self.low_state_suber = ChannelSubscriber("rt/lowstate", LowState_)
         self.low_state_suber.Init(self.low_state_handler, 10)
 
@@ -65,7 +61,6 @@ class TaskExecutorNode(Node):
             10
         ) 
         self.cmd_publisher = self.create_publisher(String, 'robot_command', 10)
-        # for real dog use Nav2
         #self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         self.detection_service_client = self.create_client(Trigger, 'trigger_detection')
@@ -104,7 +99,6 @@ class TaskExecutorNode(Node):
                 self.state = NodeState.NAVIGATING
                 self.get_logger().info(f'State changed: NAVIGATING to {location_name}')
                 
-                # replace here with new navigator
                 x, y = self.locations[location_name]
                 self.send_navigation_goal(float(x), float(y))
             else:
@@ -121,8 +115,6 @@ class TaskExecutorNode(Node):
             action_name = match.group(1)
             self.get_logger().info(f'Interpreted action: {action_name}')
             
-            # Here can call different services based on the action name
-            # For now just handle a simulated "detection"
             if self.detection_service_client.service_is_ready():
                 self.state = NodeState.DETECTING
                 self.get_logger().info(f'State changed: DETECTING for action {action_name}')      
@@ -194,14 +186,12 @@ class TaskExecutorNode(Node):
             self.execute_next_action() #？
     
     def quaternion_to_euler(self, qw, qx, qy, qz):
-        """将四元数转换为欧拉角（获取 yaw 角）"""
         siny_cosp = 2 * (qw * qz + qx * qy)
         cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return yaw
     
     def low_state_handler(self, msg):
-        """从 LowState 获取 IMU 四元数并计算朝向"""
         try:
             if hasattr(msg, 'imu_state') and hasattr(msg.imu_state, 'quaternion'):
                 qw = msg.imu_state.quaternion[0]  
@@ -210,7 +200,6 @@ class TaskExecutorNode(Node):
                 qz = msg.imu_state.quaternion[3]  
                 
                 yaw_raw = self.quaternion_to_euler(qw, qx, qy, qz)
-                # 应用符号校正，消除坐标系/正负号约定差异；若属性尚未初始化，使用 1.0 作为默认值
                 yaw_sign = self.yaw_sign if hasattr(self, 'yaw_sign') else 1.0
                 self.current_theta = yaw_sign * yaw_raw
                 
@@ -255,7 +244,6 @@ class TaskExecutorNode(Node):
         return angle
     
     def unicycle_controller(self):
-        # 保护：若容差未初始化，设为默认值
         if not hasattr(self, 'tolerance'):
             self.tolerance = 0.3
         error_x = self.target_x - self.current_x
@@ -267,7 +255,6 @@ class TaskExecutorNode(Node):
                               f'Distance: {distance_error:.2f}m')
 
         if distance_error < self.tolerance:
-            # 显式发送一次 stop 指令，确保落地停止
             cmd_msg = String()
             cmd_msg.data = "stop"
             self.cmd_publisher.publish(cmd_msg)
@@ -276,10 +263,8 @@ class TaskExecutorNode(Node):
             self.execute_next_action()
             return
 
-        # 使用向量法计算角误差，更鲁棒（避免欧拉角约定差异）
         norm = math.hypot(error_x, error_y)
         if norm < 1e-6:
-            # 显式发送一次 stop 指令，确保落地停止
             cmd_msg = String()
             cmd_msg.data = "stop"
             self.cmd_publisher.publish(cmd_msg)
@@ -288,13 +273,12 @@ class TaskExecutorNode(Node):
             self.execute_next_action()
             return
 
-        ux, uy = error_x / norm, error_y / norm  # 目标方向单位向量
-        hx, hy = math.cos(self.current_theta), math.sin(self.current_theta)  # 当前朝向单位向量
-        cross_z = hx * uy - hy * ux  # >0 表示目标在左侧；<0 表示目标在右侧
+        ux, uy = error_x / norm, error_y / norm  
+        hx, hy = math.cos(self.current_theta), math.sin(self.current_theta)  
+        cross_z = hx * uy - hy * ux  
         dot = hx * ux + hy * uy
         angle_error = math.atan2(cross_z, dot)
 
-        # 动态角阈值：默认严格；若 x 已接近而 y 仍偏大，则更严格，避免先把 x 走满
         angle_threshold = 0.2
         if abs(error_x) < 0.25 and abs(error_y) > 0.5:
             angle_threshold = 0.1
@@ -303,7 +287,6 @@ class TaskExecutorNode(Node):
             f'Angle error: {angle_error:.2f} rad (cross_z={cross_z:+.2f}, dot={dot:+.2f}), threshold={angle_threshold:.2f}'
         )
 
-        # 仅在航向足够对正且确实朝向目标（dot>0）时才前进
         if abs(angle_error) > angle_threshold or dot <= 0.0:
             cmd_msg = String()
             if angle_error > 0:
@@ -321,7 +304,6 @@ class TaskExecutorNode(Node):
         self.cmd_publisher.publish(cmd_msg)
 
     def stop_robot(self):
-        """停止机器人运动"""
         cmd_msg = String()
         cmd_msg.data = "stop"
         self.cmd_publisher.publish(cmd_msg)
