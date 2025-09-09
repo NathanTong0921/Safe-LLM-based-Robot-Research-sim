@@ -34,7 +34,13 @@ class TaskExecutorNode(Node):
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_z = 0.0
-        
+        self.current_theta = 0.0  # 添加朝向角
+        self.current_vx = 0.0
+        self.current_vy = 0.0
+        self.current_vz = 0.0
+        self.target_x = 0.0
+        self.target_y = 0.0
+        self.tolerance = 0.3
 
         # Location for testing
         self.locations = {
@@ -209,18 +215,12 @@ class TaskExecutorNode(Node):
                 qy = msg.imu_state.quaternion[2]  
                 qz = msg.imu_state.quaternion[3]  
                 
-                yaw_raw = self.quaternion_to_euler(qw, qx, qy, qz)
-                # 应用符号校正，消除坐标系/正负号约定差异；若属性尚未初始化，使用 1.0 作为默认值
-                yaw_sign = self.yaw_sign if hasattr(self, 'yaw_sign') else 1.0
-                self.current_theta = yaw_sign * yaw_raw
+                self.current_theta = self.quaternion_to_euler(qw, qx, qy, qz)
                 
                 if hasattr(self, '_last_theta_log_time'):
                     current_time = self.get_clock().now().nanoseconds / 1e9
                     if current_time - self._last_theta_log_time > 2.0: 
-                        ys = self.yaw_sign if hasattr(self, 'yaw_sign') else 1.0
-                        self.get_logger().info(
-                            f'Robot orientation: θ={self.current_theta:.3f} rad ({math.degrees(self.current_theta):.1f} deg), yaw_sign={ys:+.0f}'
-                        )
+                        self.get_logger().info(f'Robot orientation: θ={self.current_theta:.3f} rad ({math.degrees(self.current_theta):.1f} deg)')
                         self._last_theta_log_time = current_time
                 else:
                     self._last_theta_log_time = self.get_clock().now().nanoseconds / 1e9
@@ -255,9 +255,6 @@ class TaskExecutorNode(Node):
         return angle
     
     def unicycle_controller(self):
-        # 保护：若容差未初始化，设为默认值
-        if not hasattr(self, 'tolerance'):
-            self.tolerance = 0.3
         error_x = self.target_x - self.current_x
         error_y = self.target_y - self.current_y
         distance_error = math.sqrt(error_x**2 + error_y**2)
@@ -267,58 +264,35 @@ class TaskExecutorNode(Node):
                               f'Distance: {distance_error:.2f}m')
 
         if distance_error < self.tolerance:
-            # 显式发送一次 stop 指令，确保落地停止
-            cmd_msg = String()
-            cmd_msg.data = "stop"
-            self.cmd_publisher.publish(cmd_msg)
-            self.get_logger().info('Reached target position, sent stop.')
+            self.get_logger().info('Reached target position.')
             self.stop_robot()
             self.execute_next_action()
             return
 
-        # 使用向量法计算角误差，更鲁棒（避免欧拉角约定差异）
-        norm = math.hypot(error_x, error_y)
-        if norm < 1e-6:
-            # 显式发送一次 stop 指令，确保落地停止
-            cmd_msg = String()
-            cmd_msg.data = "stop"
-            self.cmd_publisher.publish(cmd_msg)
-            self.get_logger().info('Very close to target, sent stop.')
-            self.stop_robot()
-            self.execute_next_action()
-            return
-
-        ux, uy = error_x / norm, error_y / norm  # 目标方向单位向量
-        hx, hy = math.cos(self.current_theta), math.sin(self.current_theta)  # 当前朝向单位向量
-        cross_z = hx * uy - hy * ux  # >0 表示目标在左侧；<0 表示目标在右侧
-        dot = hx * ux + hy * uy
-        angle_error = math.atan2(cross_z, dot)
-
-        # 动态角阈值：默认严格；若 x 已接近而 y 仍偏大，则更严格，避免先把 x 走满
-        angle_threshold = 0.2
-        if abs(error_x) < 0.25 and abs(error_y) > 0.5:
-            angle_threshold = 0.1
-
-        self.get_logger().info(
-            f'Angle error: {angle_error:.2f} rad (cross_z={cross_z:+.2f}, dot={dot:+.2f}), threshold={angle_threshold:.2f}'
-        )
-
-        # 仅在航向足够对正且确实朝向目标（dot>0）时才前进
-        if abs(angle_error) > angle_threshold or dot <= 0.0:
-            cmd_msg = String()
+        target_theta = math.atan2(error_y, error_x)
+        angle_error = self.normalize_angle(target_theta - self.current_theta)
+        
+        angle_threshold = 0.4  
+        
+        self.get_logger().info(f'Target angle: {target_theta:.2f}, Current angle: {self.current_theta:.2f}, '
+                              f'Angle error: {angle_error:.2f} rad')
+        
+        if abs(angle_error) > angle_threshold:
             if angle_error > 0:
+                cmd_msg = String()
                 cmd_msg.data = "turn_left"
-                self.get_logger().info('Not aligned → turn_left')
+                self.cmd_publisher.publish(cmd_msg)
+                self.get_logger().info('Turning left to correct orientation')
             else:
+                cmd_msg = String()
                 cmd_msg.data = "turn_right"
-                self.get_logger().info('Not aligned → turn_right')
+                self.cmd_publisher.publish(cmd_msg)
+                self.get_logger().info('Turning right to correct orientation')
         else:
             cmd_msg = String()
             cmd_msg.data = "walk"
+            self.cmd_publisher.publish(cmd_msg)
             self.get_logger().info('Walking forward to target')
-
-
-        self.cmd_publisher.publish(cmd_msg)
 
     def stop_robot(self):
         """停止机器人运动"""
@@ -339,7 +313,7 @@ class TaskExecutorNode(Node):
         
         self.get_logger().info(f'Starting custom navigation to ({x}, {y})')
         
-        self.control_timer = self.create_timer(0.2, self.unicycle_controller)
+        self.control_timer = self.create_timer(0.5, self.unicycle_controller)
 
 def main(args=None):
     rclpy.init(args=args)
