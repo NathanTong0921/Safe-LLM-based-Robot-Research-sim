@@ -10,6 +10,7 @@ import math
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__SportModeState_
+# 添加 LowState 相关导入
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowState_
 
@@ -33,8 +34,15 @@ class TaskExecutorNode(Node):
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_z = 0.0
-        
+        self.current_theta = 0.0  # 添加朝向角
+        self.current_vx = 0.0
+        self.current_vy = 0.0
+        self.current_vz = 0.0
+        self.target_x = 0.0
+        self.target_y = 0.0
+        self.tolerance = 0.3
 
+        # Location for testing
         self.locations = {
             'entrance': (0.0, 0.0),
             'pepper_area': (3.5, 2.0),
@@ -48,9 +56,11 @@ class TaskExecutorNode(Node):
         
         ChannelFactoryInitialize(1, "lo")
 
+        # 订阅高层状态（位置和速度）
         self.high_state_suber = ChannelSubscriber("rt/sportmodestate", SportModeState_)
         self.high_state_suber.Init(self.high_state_handler, 10)
         
+        # 添加订阅低层状态（IMU 四元数）
         self.low_state_suber = ChannelSubscriber("rt/lowstate", LowState_)
         self.low_state_suber.Init(self.low_state_handler, 10)
 
@@ -61,6 +71,7 @@ class TaskExecutorNode(Node):
             10
         ) 
         self.cmd_publisher = self.create_publisher(String, 'robot_command', 10)
+        # for real dog use Nav2
         #self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         self.detection_service_client = self.create_client(Trigger, 'trigger_detection')
@@ -99,6 +110,7 @@ class TaskExecutorNode(Node):
                 self.state = NodeState.NAVIGATING
                 self.get_logger().info(f'State changed: NAVIGATING to {location_name}')
                 
+                # replace here with new navigator
                 x, y = self.locations[location_name]
                 self.send_navigation_goal(float(x), float(y))
             else:
@@ -115,6 +127,8 @@ class TaskExecutorNode(Node):
             action_name = match.group(1)
             self.get_logger().info(f'Interpreted action: {action_name}')
             
+            # Here can call different services based on the action name
+            # For now just handle a simulated "detection"
             if self.detection_service_client.service_is_ready():
                 self.state = NodeState.DETECTING
                 self.get_logger().info(f'State changed: DETECTING for action {action_name}')      
@@ -186,12 +200,14 @@ class TaskExecutorNode(Node):
             self.execute_next_action() #？
     
     def quaternion_to_euler(self, qw, qx, qy, qz):
+        """将四元数转换为欧拉角（获取 yaw 角）"""
         siny_cosp = 2 * (qw * qz + qx * qy)
         cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return yaw
     
     def low_state_handler(self, msg):
+        """从 LowState 获取 IMU 四元数并计算朝向"""
         try:
             if hasattr(msg, 'imu_state') and hasattr(msg.imu_state, 'quaternion'):
                 qw = msg.imu_state.quaternion[0]  
@@ -199,17 +215,12 @@ class TaskExecutorNode(Node):
                 qy = msg.imu_state.quaternion[2]  
                 qz = msg.imu_state.quaternion[3]  
                 
-                yaw_raw = self.quaternion_to_euler(qw, qx, qy, qz)
-                yaw_sign = self.yaw_sign if hasattr(self, 'yaw_sign') else 1.0
-                self.current_theta = yaw_sign * yaw_raw
+                self.current_theta = self.quaternion_to_euler(qw, qx, qy, qz)
                 
                 if hasattr(self, '_last_theta_log_time'):
                     current_time = self.get_clock().now().nanoseconds / 1e9
                     if current_time - self._last_theta_log_time > 2.0: 
-                        ys = self.yaw_sign if hasattr(self, 'yaw_sign') else 1.0
-                        self.get_logger().info(
-                            f'Robot orientation: θ={self.current_theta:.3f} rad ({math.degrees(self.current_theta):.1f} deg), yaw_sign={ys:+.0f}'
-                        )
+                        self.get_logger().info(f'Robot orientation: θ={self.current_theta:.3f} rad ({math.degrees(self.current_theta):.1f} deg)')
                         self._last_theta_log_time = current_time
                 else:
                     self._last_theta_log_time = self.get_clock().now().nanoseconds / 1e9
@@ -244,8 +255,6 @@ class TaskExecutorNode(Node):
         return angle
     
     def unicycle_controller(self):
-        if not hasattr(self, 'tolerance'):
-            self.tolerance = 0.3
         error_x = self.target_x - self.current_x
         error_y = self.target_y - self.current_y
         distance_error = math.sqrt(error_x**2 + error_y**2)
@@ -255,55 +264,38 @@ class TaskExecutorNode(Node):
                               f'Distance: {distance_error:.2f}m')
 
         if distance_error < self.tolerance:
-            cmd_msg = String()
-            cmd_msg.data = "stop"
-            self.cmd_publisher.publish(cmd_msg)
-            self.get_logger().info('Reached target position, sent stop.')
+            self.get_logger().info('Reached target position.')
             self.stop_robot()
             self.execute_next_action()
             return
 
-        norm = math.hypot(error_x, error_y)
-        if norm < 1e-6:
-            cmd_msg = String()
-            cmd_msg.data = "stop"
-            self.cmd_publisher.publish(cmd_msg)
-            self.get_logger().info('Very close to target, sent stop.')
-            self.stop_robot()
-            self.execute_next_action()
-            return
-
-        ux, uy = error_x / norm, error_y / norm  
-        hx, hy = math.cos(self.current_theta), math.sin(self.current_theta)  
-        cross_z = hx * uy - hy * ux  
-        dot = hx * ux + hy * uy
-        angle_error = math.atan2(cross_z, dot)
-
-        angle_threshold = 0.2
-        if abs(error_x) < 0.25 and abs(error_y) > 0.5:
-            angle_threshold = 0.1
-
-        self.get_logger().info(
-            f'Angle error: {angle_error:.2f} rad (cross_z={cross_z:+.2f}, dot={dot:+.2f}), threshold={angle_threshold:.2f}'
-        )
-
-        if abs(angle_error) > angle_threshold or dot <= 0.0:
-            cmd_msg = String()
+        target_theta = math.atan2(error_y, error_x)
+        angle_error = self.normalize_angle(target_theta - self.current_theta)
+        
+        angle_threshold = 0.4  
+        
+        self.get_logger().info(f'Target angle: {target_theta:.2f}, Current angle: {self.current_theta:.2f}, '
+                              f'Angle error: {angle_error:.2f} rad')
+        
+        if abs(angle_error) > angle_threshold:
             if angle_error > 0:
+                cmd_msg = String()
                 cmd_msg.data = "turn_left"
-                self.get_logger().info('Not aligned → turn_left')
+                self.cmd_publisher.publish(cmd_msg)
+                self.get_logger().info('Turning left to correct orientation')
             else:
+                cmd_msg = String()
                 cmd_msg.data = "turn_right"
-                self.get_logger().info('Not aligned → turn_right')
+                self.cmd_publisher.publish(cmd_msg)
+                self.get_logger().info('Turning right to correct orientation')
         else:
             cmd_msg = String()
             cmd_msg.data = "walk"
+            self.cmd_publisher.publish(cmd_msg)
             self.get_logger().info('Walking forward to target')
 
-
-        self.cmd_publisher.publish(cmd_msg)
-
     def stop_robot(self):
+        """停止机器人运动"""
         cmd_msg = String()
         cmd_msg.data = "stop"
         self.cmd_publisher.publish(cmd_msg)
@@ -321,7 +313,7 @@ class TaskExecutorNode(Node):
         
         self.get_logger().info(f'Starting custom navigation to ({x}, {y})')
         
-        self.control_timer = self.create_timer(0.2, self.unicycle_controller)
+        self.control_timer = self.create_timer(0.5, self.unicycle_controller)
 
 def main(args=None):
     rclpy.init(args=args)
